@@ -150,9 +150,6 @@ struct ThreadSafeFinalize {
     ThreadSafeFinalize* finalizeData =
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env));
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
@@ -166,9 +163,6 @@ struct ThreadSafeFinalize {
     ThreadSafeFinalize* finalizeData =
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env), finalizeData->data);
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
@@ -182,9 +176,6 @@ struct ThreadSafeFinalize {
     ThreadSafeFinalize* finalizeData =
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env), static_cast<ContextType*>(rawContext));
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
@@ -199,15 +190,11 @@ struct ThreadSafeFinalize {
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env), finalizeData->data,
         static_cast<ContextType*>(rawContext));
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
   FinalizerDataType* data;
   Finalizer callback;
-  napi_threadsafe_function* tsfn;
 };
 #endif
 
@@ -3119,16 +3106,26 @@ inline ObjectWrap<T>::ObjectWrap(const Napi::CallbackInfo& callbackInfo) {
   napi_value wrapper = callbackInfo.This();
   napi_status status;
   napi_ref ref;
-  T* instance = static_cast<T*>(this);
-  status = napi_wrap(env, wrapper, instance, FinalizeCallback, nullptr, &ref);
+  status = napi_wrap(env, wrapper, this, FinalizeCallback, nullptr, &ref);
   NAPI_THROW_IF_FAILED_VOID(env, status);
 
-  Reference<Object>* instanceRef = instance;
+  Reference<Object>* instanceRef = this;
   *instanceRef = Reference<Object>(env, ref);
 }
 
-template<typename T>
-inline ObjectWrap<T>::~ObjectWrap() {}
+template <typename T>
+inline ObjectWrap<T>::~ObjectWrap() {
+  // If the JS object still exists at this point, remove the finalizer added
+  // through `napi_wrap()`.
+  if (!IsEmpty()) {
+    Object object = Value();
+    // It is not valid to call `napi_remove_wrap()` with an empty `object`.
+    // This happens e.g. during garbage collection.
+    if (!object.IsEmpty() && _construction_failed) {
+      napi_remove_wrap(Env(), object, nullptr);
+    }
+  }
+}
 
 template<typename T>
 inline T* ObjectWrap<T>::Unwrap(Object wrapper) {
@@ -3696,10 +3693,21 @@ inline napi_value ObjectWrap<T>::ConstructorCallbackWrapper(
     return nullptr;
   }
 
-  T* instance;
   napi_value wrapper = details::WrapCallback([&] {
     CallbackInfo callbackInfo(env, info);
-    instance = new T(callbackInfo);
+    T* instance = new T(callbackInfo);
+#ifdef NAPI_CPP_EXCEPTIONS
+    instance->_construction_failed = false;
+#else
+    if (callbackInfo.Env().IsExceptionPending()) {
+      // We need to clear the exception so that removing the wrap might work.
+      Error e = callbackInfo.Env().GetAndClearPendingException();
+      delete instance;
+      e.ThrowAsJavaScriptException();
+    } else {
+      instance->_construction_failed = false;
+    }
+# endif  // NAPI_CPP_EXCEPTIONS
     return callbackInfo.This();
   });
 
@@ -3824,7 +3832,7 @@ inline napi_value ObjectWrap<T>::InstanceSetterCallbackWrapper(
 
 template <typename T>
 inline void ObjectWrap<T>::FinalizeCallback(napi_env env, void* data, void* /*hint*/) {
-  T* instance = reinterpret_cast<T*>(data);
+  ObjectWrap<T>* instance = static_cast<ObjectWrap<T>*>(data);
   instance->Finalize(Napi::Env(env));
   delete instance;
 }
@@ -4085,8 +4093,8 @@ inline AsyncWorker::AsyncWorker(const Object& receiver,
       _env, resource_name, NAPI_AUTO_LENGTH, &resource_id);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 
-  status = napi_create_async_work(_env, resource, resource_id, OnExecute,
-                                  OnWorkComplete, this, &_work);
+  status = napi_create_async_work(_env, resource, resource_id, OnAsyncWorkExecute,
+                                  OnAsyncWorkComplete, this, &_work);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 }
 
@@ -4111,8 +4119,8 @@ inline AsyncWorker::AsyncWorker(Napi::Env env,
       _env, resource_name, NAPI_AUTO_LENGTH, &resource_id);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 
-  status = napi_create_async_work(_env, resource, resource_id, OnExecute,
-                                  OnWorkComplete, this, &_work);
+  status = napi_create_async_work(_env, resource, resource_id, OnAsyncWorkExecute,
+                                  OnAsyncWorkComplete, this, &_work);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 }
 
@@ -4199,40 +4207,51 @@ inline void AsyncWorker::SetError(const std::string& error) {
 inline std::vector<napi_value> AsyncWorker::GetResult(Napi::Env /*env*/) {
   return {};
 }
+// The OnAsyncWorkExecute method receives an napi_env argument. However, do NOT
+// use it within this method, as it does not run on the JavaScript thread and
+// must not run any method that would cause JavaScript to run. In practice,
+// this means that almost any use of napi_env will be incorrect.
+inline void AsyncWorker::OnAsyncWorkExecute(napi_env env, void* asyncworker) {
+  AsyncWorker* self = static_cast<AsyncWorker*>(asyncworker);
+  self->OnExecute(env);
+}
 // The OnExecute method receives an napi_env argument. However, do NOT
-// use it within this method, as it does not run on the main thread and must
-// not run any method that would cause JavaScript to run. In practice, this
-// means that almost any use of napi_env will be incorrect.
-inline void AsyncWorker::OnExecute(napi_env /*DO_NOT_USE*/, void* this_pointer) {
-  AsyncWorker* self = static_cast<AsyncWorker*>(this_pointer);
+// use it within this method, as it does not run on the JavaScript thread and
+// must not run any method that would cause JavaScript to run. In practice,
+// this means that almost any use of napi_env will be incorrect.
+inline void AsyncWorker::OnExecute(Napi::Env /*DO_NOT_USE*/) {
 #ifdef NAPI_CPP_EXCEPTIONS
   try {
-    self->Execute();
+    Execute();
   } catch (const std::exception& e) {
-    self->SetError(e.what());
+    SetError(e.what());
   }
 #else // NAPI_CPP_EXCEPTIONS
-  self->Execute();
+  Execute();
 #endif // NAPI_CPP_EXCEPTIONS
 }
 
-inline void AsyncWorker::OnWorkComplete(
-    napi_env /*env*/, napi_status status, void* this_pointer) {
-  AsyncWorker* self = static_cast<AsyncWorker*>(this_pointer);
+inline void AsyncWorker::OnAsyncWorkComplete(napi_env env,
+                                             napi_status status,
+                                             void* asyncworker) {
+  AsyncWorker* self = static_cast<AsyncWorker*>(asyncworker);
+  self->OnWorkComplete(env, status);
+}
+inline void AsyncWorker::OnWorkComplete(Napi::Env /*env*/, napi_status status) {
   if (status != napi_cancelled) {
-    HandleScope scope(self->_env);
+    HandleScope scope(_env);
     details::WrapCallback([&] {
-      if (self->_error.size() == 0) {
-        self->OnOK();
+      if (_error.size() == 0) {
+        OnOK();
       }
       else {
-        self->OnError(Error::New(self->_env, self->_error));
+        OnError(Error::New(_env, _error));
       }
       return nullptr;
     });
   }
-  if (!self->_suppress_destruct) {
-    self->Destroy();
+  if (!_suppress_destruct) {
+    Destroy();
   }
 }
 
@@ -4528,7 +4547,7 @@ inline ThreadSafeFunction ThreadSafeFunction::New(napi_env env,
 
   ThreadSafeFunction tsfn;
   auto* finalizeData = new details::ThreadSafeFinalize<ContextType, Finalizer,
-      FinalizerDataType>({ data, finalizeCallback, &tsfn._tsfn });
+      FinalizerDataType>({ data, finalizeCallback });
   napi_status status = napi_create_threadsafe_function(env, callback, resource,
       Value::From(env, resourceName), maxQueueSize, initialThreadCount,
       finalizeData, wrapper, context, CallJS, &tsfn._tsfn);
@@ -4571,9 +4590,89 @@ inline void ThreadSafeFunction::CallJS(napi_env env,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Async Progress Worker Base class
+////////////////////////////////////////////////////////////////////////////////
+template <typename DataType>
+inline AsyncProgressWorkerBase<DataType>::AsyncProgressWorkerBase(const Object& receiver,
+                                                                  const Function& callback,
+                                                                  const char* resource_name,
+                                                                  const Object& resource,
+                                                                  size_t queue_size)
+  : AsyncWorker(receiver, callback, resource_name, resource) {
+  // Fill all possible arguments to work around ambiguous ThreadSafeFunction::New signatures.
+  _tsfn = ThreadSafeFunction::New(callback.Env(),
+                                  callback,
+                                  resource,
+                                  resource_name,
+                                  queue_size,
+                                  /** initialThreadCount */ 1,
+                                  /** context */ this,
+                                  OnThreadSafeFunctionFinalize,
+                                  /** finalizeData */ this);
+}
+
+#if NAPI_VERSION > 4
+template <typename DataType>
+inline AsyncProgressWorkerBase<DataType>::AsyncProgressWorkerBase(Napi::Env env,
+                                                                  const char* resource_name,
+                                                                  const Object& resource,
+                                                                  size_t queue_size)
+  : AsyncWorker(env, resource_name, resource) {
+  // TODO: Once the changes to make the callback optional for threadsafe
+  // functions are available on all versions we can remove the dummy Function here.
+  Function callback;
+  // Fill all possible arguments to work around ambiguous ThreadSafeFunction::New signatures.
+  _tsfn = ThreadSafeFunction::New(env,
+                                  callback,
+                                  resource,
+                                  resource_name,
+                                  queue_size,
+                                  /** initialThreadCount */ 1,
+                                  /** context */ this,
+                                  OnThreadSafeFunctionFinalize,
+                                  /** finalizeData */ this);
+}
+#endif
+
+template<typename DataType>
+inline AsyncProgressWorkerBase<DataType>::~AsyncProgressWorkerBase() {
+  // Abort pending tsfn call.
+  // Don't send progress events after we've already completed.
+  // It's ok to call ThreadSafeFunction::Abort and ThreadSafeFunction::Release duplicated.
+  _tsfn.Abort();
+}
+
+template <typename DataType>
+inline void AsyncProgressWorkerBase<DataType>::OnAsyncWorkProgress(Napi::Env /* env */,
+                                Napi::Function /* jsCallback */,
+                                void* data) {
+  ThreadSafeData* tsd = static_cast<ThreadSafeData*>(data);
+  tsd->asyncprogressworker()->OnWorkProgress(tsd->data());
+}
+
+template <typename DataType>
+inline napi_status AsyncProgressWorkerBase<DataType>::NonBlockingCall(DataType* data) {
+  auto tsd = new AsyncProgressWorkerBase::ThreadSafeData(this, data);
+  return _tsfn.NonBlockingCall(tsd, OnAsyncWorkProgress);
+}
+
+template <typename DataType>
+inline void AsyncProgressWorkerBase<DataType>::OnWorkComplete(Napi::Env /* env */, napi_status status) {
+  _work_completed = true;
+  _complete_status = status;
+  _tsfn.Release();
+}
+
+template <typename DataType>
+inline void AsyncProgressWorkerBase<DataType>::OnThreadSafeFunctionFinalize(Napi::Env env, void* /* data */, AsyncProgressWorkerBase* context) {
+  if (context->_work_completed) {
+    context->AsyncWorker::OnWorkComplete(env, context->_complete_status);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Async Progress Worker class
 ////////////////////////////////////////////////////////////////////////////////
-
 template<class T>
 inline AsyncProgressWorker<T>::AsyncProgressWorker(const Function& callback)
   : AsyncProgressWorker(callback, "generic") {
@@ -4597,14 +4696,14 @@ inline AsyncProgressWorker<T>::AsyncProgressWorker(const Function& callback,
 
 template<class T>
 inline AsyncProgressWorker<T>::AsyncProgressWorker(const Object& receiver,
-                                const Function& callback)
+                                                   const Function& callback)
   : AsyncProgressWorker(receiver, callback, "generic") {
 }
 
 template<class T>
 inline AsyncProgressWorker<T>::AsyncProgressWorker(const Object& receiver,
-                                const Function& callback,
-                                const char* resource_name)
+                                                   const Function& callback,
+                                                   const char* resource_name)
   : AsyncProgressWorker(receiver,
                 callback,
                 resource_name,
@@ -4616,10 +4715,9 @@ inline AsyncProgressWorker<T>::AsyncProgressWorker(const Object& receiver,
                                                    const Function& callback,
                                                    const char* resource_name,
                                                    const Object& resource)
-  : AsyncWorker(receiver, callback, resource_name, resource),
+  : AsyncProgressWorkerBase(receiver, callback, resource_name, resource),
     _asyncdata(nullptr),
     _asyncsize(0) {
-  _tsfn = ThreadSafeFunction::New(callback.Env(), callback, resource_name, 1, 1);
 }
 
 #if NAPI_VERSION > 4
@@ -4630,35 +4728,27 @@ inline AsyncProgressWorker<T>::AsyncProgressWorker(Napi::Env env)
 
 template<class T>
 inline AsyncProgressWorker<T>::AsyncProgressWorker(Napi::Env env,
-                                const char* resource_name)
+                                                   const char* resource_name)
   : AsyncProgressWorker(env, resource_name, Object::New(env)) {
 }
 
 template<class T>
 inline AsyncProgressWorker<T>::AsyncProgressWorker(Napi::Env env,
-                                const char* resource_name,
-                                const Object& resource)
-  : AsyncWorker(env, resource_name, resource),
+                                                   const char* resource_name,
+                                                   const Object& resource)
+  : AsyncProgressWorkerBase(env, resource_name, resource),
     _asyncdata(nullptr),
     _asyncsize(0) {
-  // TODO: Once the changes to make the callback optional for threadsafe
-  // functions are no longer optional we can remove the dummy Function here.
-  Function callback;
-  _tsfn = ThreadSafeFunction::New(env, callback, resource_name, 1, 1);
 }
 #endif
 
 template<class T>
 inline AsyncProgressWorker<T>::~AsyncProgressWorker() {
-  // Abort pending tsfn call.
-  // Don't send progress events after we've already completed.
-  _tsfn.Abort();
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(this->_mutex);
     _asyncdata = nullptr;
     _asyncsize = 0;
   }
-  _tsfn.Release();
 }
 
 template<class T>
@@ -4668,20 +4758,18 @@ inline void AsyncProgressWorker<T>::Execute() {
 }
 
 template<class T>
-inline void AsyncProgressWorker<T>::WorkProgress_(Napi::Env /* env */, Napi::Function /* jsCallback */, void* _data) {
-  AsyncProgressWorker* self = static_cast<AsyncProgressWorker*>(_data);
-
+inline void AsyncProgressWorker<T>::OnWorkProgress(void*) {
   T* data;
   size_t size;
   {
-    std::lock_guard<std::mutex> lock(self->_mutex);
-    data = self->_asyncdata;
-    size = self->_asyncsize;
-    self->_asyncdata = nullptr;
-    self->_asyncsize = 0;
+    std::lock_guard<std::mutex> lock(this->_mutex);
+    data = this->_asyncdata;
+    size = this->_asyncsize;
+    this->_asyncdata = nullptr;
+    this->_asyncsize = 0;
   }
 
-  self->OnProgress(data, size);
+  this->OnProgress(data, size);
   delete[] data;
 }
 
@@ -4692,19 +4780,19 @@ inline void AsyncProgressWorker<T>::SendProgress_(const T* data, size_t count) {
 
     T* old_data;
     {
-      std::lock_guard<std::mutex> lock(_mutex);
+      std::lock_guard<std::mutex> lock(this->_mutex);
       old_data = _asyncdata;
       _asyncdata = new_data;
       _asyncsize = count;
     }
-    _tsfn.NonBlockingCall(this, WorkProgress_);
+    this->NonBlockingCall(nullptr);
 
     delete[] old_data;
 }
 
 template<class T>
 inline void AsyncProgressWorker<T>::Signal() const {
-  _tsfn.NonBlockingCall(this, WorkProgress_);
+  this->NonBlockingCall(static_cast<T*>(nullptr));
 }
 
 template<class T>
@@ -4717,6 +4805,123 @@ inline void AsyncProgressWorker<T>::ExecutionProgress::Send(const T* data, size_
   _worker->SendProgress_(data, count);
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Async Progress Queue Worker class
+////////////////////////////////////////////////////////////////////////////////
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Function& callback)
+  : AsyncProgressQueueWorker(callback, "generic") {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Function& callback,
+                                                             const char* resource_name)
+  : AsyncProgressQueueWorker(callback, resource_name, Object::New(callback.Env())) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Function& callback,
+                                                             const char* resource_name,
+                                                             const Object& resource)
+  : AsyncProgressQueueWorker(Object::New(callback.Env()),
+                             callback,
+                             resource_name,
+                             resource) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Object& receiver,
+                                                             const Function& callback)
+  : AsyncProgressQueueWorker(receiver, callback, "generic") {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Object& receiver,
+                                                             const Function& callback,
+                                                             const char* resource_name)
+  : AsyncProgressQueueWorker(receiver,
+                             callback,
+                             resource_name,
+                             Object::New(callback.Env())) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Object& receiver,
+                                                             const Function& callback,
+                                                             const char* resource_name,
+                                                             const Object& resource)
+  : AsyncProgressWorkerBase<std::pair<T*, size_t>>(receiver, callback, resource_name, resource, /** unlimited queue size */0) {
+}
+
+#if NAPI_VERSION > 4
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(Napi::Env env)
+  : AsyncProgressQueueWorker(env, "generic") {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(Napi::Env env,
+                                const char* resource_name)
+  : AsyncProgressQueueWorker(env, resource_name, Object::New(env)) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(Napi::Env env,
+                                                             const char* resource_name,
+                                                             const Object& resource)
+  : AsyncProgressWorkerBase<std::pair<T*, size_t>>(env, resource_name, resource, /** unlimited queue size */0) {
+}
+#endif
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::Execute() {
+  ExecutionProgress progress(this);
+  Execute(progress);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::OnWorkProgress(std::pair<T*, size_t>* datapair) {
+  if (datapair == nullptr) {
+    return;
+  }
+
+  T *data = datapair->first;
+  size_t size = datapair->second;
+
+  this->OnProgress(data, size);
+  delete datapair;
+  delete[] data;
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::SendProgress_(const T* data, size_t count) {
+    T* new_data = new T[count];
+    std::copy(data, data + count, new_data);
+
+    auto pair = new std::pair<T*, size_t>(new_data, count);
+    this->NonBlockingCall(pair);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::Signal() const {
+  this->NonBlockingCall(nullptr);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::OnWorkComplete(Napi::Env env, napi_status status) {
+  // Draining queued items in TSFN.
+  AsyncProgressWorkerBase<std::pair<T*, size_t>>::OnWorkComplete(env, status);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::ExecutionProgress::Signal() const {
+  _worker->Signal();
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::ExecutionProgress::Send(const T* data, size_t count) const {
+  _worker->SendProgress_(data, count);
+}
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -91,6 +91,13 @@ static_assert(sizeof(char16_t) == sizeof(wchar_t), "Size mismatch between char16
 
 #endif // NAPI_CPP_EXCEPTIONS
 
+# define NAPI_DISALLOW_ASSIGN(CLASS) void operator=(const CLASS&) = delete;
+# define NAPI_DISALLOW_COPY(CLASS) CLASS(const CLASS&) = delete;
+
+#define NAPI_DISALLOW_ASSIGN_COPY(CLASS)  \
+    NAPI_DISALLOW_ASSIGN(CLASS)           \
+    NAPI_DISALLOW_COPY(CLASS)
+
 #define NAPI_FATAL_IF_FAILED(status, location, message)  \
   do {                                                   \
     if ((status) != napi_ok) {                           \
@@ -126,11 +133,9 @@ namespace Napi {
   class Array;
   class ArrayBuffer;
   class Function;
-  template <typename T> class Buffer;
   class Error;
   class PropertyDescriptor;
   class CallbackInfo;
-  template <typename T> class Reference;
   class TypedArray;
   template <typename T> class TypedArrayOf;
 
@@ -1129,7 +1134,7 @@ namespace Napi {
     // A reference can be moved but cannot be copied.
     Reference(Reference<T>&& other);
     Reference<T>& operator =(Reference<T>&& other);
-    Reference<T>& operator =(const Reference<T>&) = delete;
+    NAPI_DISALLOW_ASSIGN(Reference<T>)
 
     operator napi_ref() const;
     bool operator ==(const Reference<T> &other) const;
@@ -1174,7 +1179,7 @@ namespace Napi {
     ObjectReference& operator =(Reference<Object>&& other);
     ObjectReference(ObjectReference&& other);
     ObjectReference& operator =(ObjectReference&& other);
-    ObjectReference& operator =(const ObjectReference&) = delete;
+    NAPI_DISALLOW_ASSIGN(ObjectReference)
 
     Napi::Value Get(const char* utf8name) const;
     Napi::Value Get(const std::string& utf8name) const;
@@ -1211,8 +1216,7 @@ namespace Napi {
     FunctionReference& operator =(Reference<Function>&& other);
     FunctionReference(FunctionReference&& other);
     FunctionReference& operator =(FunctionReference&& other);
-    FunctionReference(const FunctionReference&) = delete;
-    FunctionReference& operator =(const FunctionReference&) = delete;
+    NAPI_DISALLOW_ASSIGN_COPY(FunctionReference)
 
     Napi::Value operator ()(const std::initializer_list<napi_value>& args) const;
 
@@ -1402,8 +1406,7 @@ namespace Napi {
     ~CallbackInfo();
 
     // Disallow copying to prevent multiple free of _dynamicArgs
-    CallbackInfo(CallbackInfo const &) = delete;
-    void operator=(CallbackInfo const &) = delete;
+    NAPI_DISALLOW_ASSIGN_COPY(CallbackInfo)
 
     Napi::Env Env() const;
     Value NewTarget() const;
@@ -1882,6 +1885,8 @@ namespace Napi {
     template <InstanceSetterCallback setter>
     static napi_callback WrapSetter(SetterTag<setter>) noexcept { return &This::WrappedMethod<setter>; }
     static napi_callback WrapSetter(SetterTag<nullptr>) noexcept { return nullptr; }
+
+    bool _construction_failed = true;
   };
 
   class HandleScope {
@@ -1891,8 +1896,7 @@ namespace Napi {
     ~HandleScope();
 
     // Disallow copying to prevent double close of napi_handle_scope
-    HandleScope(HandleScope const &) = delete;
-    void operator=(HandleScope const &) = delete;
+    NAPI_DISALLOW_ASSIGN_COPY(HandleScope)
 
     operator napi_handle_scope() const;
 
@@ -1910,8 +1914,7 @@ namespace Napi {
     ~EscapableHandleScope();
 
     // Disallow copying to prevent double close of napi_escapable_handle_scope
-    EscapableHandleScope(EscapableHandleScope const &) = delete;
-    void operator=(EscapableHandleScope const &) = delete;
+    NAPI_DISALLOW_ASSIGN_COPY(EscapableHandleScope)
 
     operator napi_escapable_handle_scope() const;
 
@@ -1931,8 +1934,7 @@ namespace Napi {
     virtual ~CallbackScope();
 
     // Disallow copying to prevent double close of napi_callback_scope
-    CallbackScope(CallbackScope const &) = delete;
-    void operator=(CallbackScope const &) = delete;
+    NAPI_DISALLOW_ASSIGN_COPY(CallbackScope)
 
     operator napi_callback_scope() const;
 
@@ -1952,8 +1954,7 @@ namespace Napi {
 
     AsyncContext(AsyncContext&& other);
     AsyncContext& operator =(AsyncContext&& other);
-    AsyncContext(const AsyncContext&) = delete;
-    AsyncContext& operator =(const AsyncContext&) = delete;
+    NAPI_DISALLOW_ASSIGN_COPY(AsyncContext)
 
     operator napi_async_context() const;
 
@@ -1971,8 +1972,7 @@ namespace Napi {
     // An async worker can be moved but cannot be copied.
     AsyncWorker(AsyncWorker&& other);
     AsyncWorker& operator =(AsyncWorker&& other);
-    AsyncWorker(const AsyncWorker&) = delete;
-    AsyncWorker& operator =(const AsyncWorker&) = delete;
+    NAPI_DISALLOW_ASSIGN_COPY(AsyncWorker)
 
     operator napi_async_work() const;
 
@@ -1984,6 +1984,10 @@ namespace Napi {
 
     ObjectReference& Receiver();
     FunctionReference& Callback();
+
+    virtual void OnExecute(Napi::Env env);
+    virtual void OnWorkComplete(Napi::Env env,
+                                napi_status status);
 
   protected:
     explicit AsyncWorker(const Function& callback);
@@ -2018,10 +2022,10 @@ namespace Napi {
     void SetError(const std::string& error);
 
   private:
-    static void OnExecute(napi_env env, void* this_pointer);
-    static void OnWorkComplete(napi_env env,
-                               napi_status status,
-                               void* this_pointer);
+    static inline void OnAsyncWorkExecute(napi_env env, void* asyncworker);
+    static inline void OnAsyncWorkComplete(napi_env env,
+                                           napi_status status,
+                                           void* asyncworker);
 
     napi_env _env;
     napi_async_work _work;
@@ -2237,8 +2241,55 @@ namespace Napi {
     napi_threadsafe_function _tsfn;
   };
 
+  template <typename DataType>
+  class AsyncProgressWorkerBase : public AsyncWorker {
+    public:
+     virtual void OnWorkProgress(DataType* data) = 0;
+     class ThreadSafeData {
+       public:
+        ThreadSafeData(AsyncProgressWorkerBase* asyncprogressworker, DataType* data)
+          : _asyncprogressworker(asyncprogressworker), _data(data) {}
+
+        AsyncProgressWorkerBase* asyncprogressworker() { return _asyncprogressworker; };
+        DataType* data() { return _data; };
+
+       private:
+        AsyncProgressWorkerBase* _asyncprogressworker;
+        DataType* _data;
+     };
+     void OnWorkComplete(Napi::Env env, napi_status status) override;
+    protected:
+     explicit AsyncProgressWorkerBase(const Object& receiver,
+                                      const Function& callback,
+                                      const char* resource_name,
+                                      const Object& resource,
+                                      size_t queue_size = 1);
+    virtual ~AsyncProgressWorkerBase();
+
+// Optional callback of Napi::ThreadSafeFunction only available after NAPI_VERSION 4.
+// Refs: https://github.com/nodejs/node/pull/27791
+#if NAPI_VERSION > 4
+     explicit AsyncProgressWorkerBase(Napi::Env env,
+                                      const char* resource_name,
+                                      const Object& resource,
+                                      size_t queue_size = 1);
+#endif
+
+     static inline void OnAsyncWorkProgress(Napi::Env env,
+                                            Napi::Function jsCallback,
+                                            void* data);
+
+     napi_status NonBlockingCall(DataType* data);
+
+    private:
+     ThreadSafeFunction _tsfn;
+     bool _work_completed = false;
+     napi_status _complete_status;
+     static inline void OnThreadSafeFunctionFinalize(Napi::Env env, void* data, AsyncProgressWorkerBase* context);
+  };
+
   template<class T>
-  class AsyncProgressWorker : public AsyncWorker {
+  class AsyncProgressWorker : public AsyncProgressWorkerBase<void> {
     public:
      virtual ~AsyncProgressWorker();
 
@@ -2252,40 +2303,39 @@ namespace Napi {
         AsyncProgressWorker* const _worker;
      };
 
+     void OnWorkProgress(void*) override;
+
     protected:
-    explicit AsyncProgressWorker(const Function& callback);
-    explicit AsyncProgressWorker(const Function& callback,
-                         const char* resource_name);
-    explicit AsyncProgressWorker(const Function& callback,
-                         const char* resource_name,
-                         const Object& resource);
-    explicit AsyncProgressWorker(const Object& receiver,
-                         const Function& callback);
-    explicit AsyncProgressWorker(const Object& receiver,
-                         const Function& callback,
-                         const char* resource_name);
-    explicit AsyncProgressWorker(const Object& receiver,
-                         const Function& callback,
-                         const char* resource_name,
-                         const Object& resource);
+     explicit AsyncProgressWorker(const Function& callback);
+     explicit AsyncProgressWorker(const Function& callback,
+                                  const char* resource_name);
+     explicit AsyncProgressWorker(const Function& callback,
+                                  const char* resource_name,
+                                  const Object& resource);
+     explicit AsyncProgressWorker(const Object& receiver,
+                                  const Function& callback);
+     explicit AsyncProgressWorker(const Object& receiver,
+                                  const Function& callback,
+                                  const char* resource_name);
+     explicit AsyncProgressWorker(const Object& receiver,
+                                  const Function& callback,
+                                  const char* resource_name,
+                                  const Object& resource);
 
 // Optional callback of Napi::ThreadSafeFunction only available after NAPI_VERSION 4.
 // Refs: https://github.com/nodejs/node/pull/27791
 #if NAPI_VERSION > 4
-    explicit AsyncProgressWorker(Napi::Env env);
-    explicit AsyncProgressWorker(Napi::Env env,
-                         const char* resource_name);
-    explicit AsyncProgressWorker(Napi::Env env,
-                         const char* resource_name,
-                         const Object& resource);
+     explicit AsyncProgressWorker(Napi::Env env);
+     explicit AsyncProgressWorker(Napi::Env env,
+                                  const char* resource_name);
+     explicit AsyncProgressWorker(Napi::Env env,
+                                  const char* resource_name,
+                                  const Object& resource);
 #endif
-
      virtual void Execute(const ExecutionProgress& progress) = 0;
      virtual void OnProgress(const T* data, size_t count) = 0;
 
     private:
-     static void WorkProgress_(Napi::Env env, Napi::Function jsCallback, void* data);
-
      void Execute() override;
      void Signal() const;
      void SendProgress_(const T* data, size_t count);
@@ -2293,7 +2343,60 @@ namespace Napi {
      std::mutex _mutex;
      T* _asyncdata;
      size_t _asyncsize;
-     ThreadSafeFunction _tsfn;
+  };
+
+  template<class T>
+  class AsyncProgressQueueWorker : public AsyncProgressWorkerBase<std::pair<T*, size_t>> {
+    public:
+     virtual ~AsyncProgressQueueWorker() {};
+
+     class ExecutionProgress {
+        friend class AsyncProgressQueueWorker;
+       public:
+        void Signal() const;
+        void Send(const T* data, size_t count) const;
+       private:
+        explicit ExecutionProgress(AsyncProgressQueueWorker* worker) : _worker(worker) {}
+        AsyncProgressQueueWorker* const _worker;
+     };
+
+     void OnWorkComplete(Napi::Env env, napi_status status) override;
+     void OnWorkProgress(std::pair<T*, size_t>*) override;
+
+    protected:
+     explicit AsyncProgressQueueWorker(const Function& callback);
+     explicit AsyncProgressQueueWorker(const Function& callback,
+                                       const char* resource_name);
+     explicit AsyncProgressQueueWorker(const Function& callback,
+                                       const char* resource_name,
+                                       const Object& resource);
+     explicit AsyncProgressQueueWorker(const Object& receiver,
+                                       const Function& callback);
+     explicit AsyncProgressQueueWorker(const Object& receiver,
+                                       const Function& callback,
+                                       const char* resource_name);
+     explicit AsyncProgressQueueWorker(const Object& receiver,
+                                       const Function& callback,
+                                       const char* resource_name,
+                                       const Object& resource);
+
+// Optional callback of Napi::ThreadSafeFunction only available after NAPI_VERSION 4.
+// Refs: https://github.com/nodejs/node/pull/27791
+#if NAPI_VERSION > 4
+     explicit AsyncProgressQueueWorker(Napi::Env env);
+     explicit AsyncProgressQueueWorker(Napi::Env env,
+                                       const char* resource_name);
+     explicit AsyncProgressQueueWorker(Napi::Env env,
+                                       const char* resource_name,
+                                       const Object& resource);
+#endif
+     virtual void Execute(const ExecutionProgress& progress) = 0;
+     virtual void OnProgress(const T* data, size_t count) = 0;
+
+    private:
+     void Execute() override;
+     void Signal() const;
+     void SendProgress_(const T* data, size_t count);
   };
   #endif
 

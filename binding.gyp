@@ -67,7 +67,7 @@
           'conditions': [
             ['OS != "win"', {
               'libraries': [
-                '<(PRODUCT_DIR)/../libzmq/lib/libzmq.a',
+                '<!@(pkg-config libzmq --libs)',
               ],
             }],
 

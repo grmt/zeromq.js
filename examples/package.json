@@ -5,7 +5,10 @@
     "zeromq": "file:.."
   },
   "devDependencies": {
-    "ts-node": ">= 0"
+    "babel": "^6.23.0",
+    "babel-cli": "^6.26.0",
+    "ts-node": ">= 0",
+    "typescript": "^3.8.3"
   },
   "scripts": {
     "majordomo": "ts-node majordomo",
